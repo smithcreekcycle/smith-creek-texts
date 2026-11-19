@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: smith-creek-texts
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: SHOPIFY_STORE_DOMAIN
+        value: smith-creek-bike-co.myshopify.com
+      - key: SHOPIFY_CLIENT_ID
+        sync: false
+      - key: SHOPIFY_CLIENT_SECRET
+        sync: false
+      - key: SHOPIFY_API_VERSION
+        value: "2026-10"
+      - key: HUBTIGER_INCOMING_SMS_WEBHOOK_URL
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_PHONE_NUMBER
+        sync: false
+      - key: APP_SECRET
+        generateValue: true
