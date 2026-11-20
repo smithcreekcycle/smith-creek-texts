@@ -445,7 +445,6 @@ async function handleCheckoutCompleted(session) {
           await db.recordDepositOrderError(session.id, err.message);
   }
 }
-
 start().catch(function (err) {
       console.error("Fatal startup error", err);
       process.exit(1);
