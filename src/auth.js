@@ -90,11 +90,19 @@ function requireAuth(req, res, next) {
 function requireCanada(req, res, next) {
     if (!GEO_RESTRICT_ENABLED) return next();
     const ip = req.ip;
-    const geo = ip ? geoip.lookup(ip) : null;
-    if (geo && geo.country === "CA") return next();
+        const geo = ip ? geoip.lookup(ip) : null;
+        // geoip-lite's offline database can't place shared/anycast ranges used by
+        // privacy proxies (Cloudflare WARP, iCloud Private Relay, some corporate
+        // VPNs) - those come back with no country at all, not a wrong one. Only
+        // block when the lookup positively names a non-Canadian country; treat an
+        // inconclusive lookup as "can't tell" rather than "not Canada", since the
+        // login itself is still locked to one address with single-use, hashed,
+        // 15-minute tokens and rate limiting regardless of this check.
+        const country = geo && geo.country ? geo.country : null;
+        if (country === null || country === "CA") return next(););
     console.warn("Blocked a non-Canadian access attempt", {
           ip,
-          country: geo ? geo.country : "unknown",
+          country: country || "unknown",
           path: req.path,
     });
     return res.status(403).type("html").send(`<!doctype html>
