@@ -99,7 +99,7 @@ function requireCanada(req, res, next) {
         // login itself is still locked to one address with single-use, hashed,
         // 15-minute tokens and rate limiting regardless of this check.
         const country = geo && geo.country ? geo.country : null;
-        if (country === null || country === "CA") return next(););
+        if (country === null || country === "CA") return next();
     console.warn("Blocked a non-Canadian access attempt", {
           ip,
           country: country || "unknown",
