@@ -49,7 +49,7 @@ const app = express();
 // Express read the real client IP (for the Canada-only check and rate
 // limiting) and the real protocol from X-Forwarded-* headers instead of
 // Render's own internal hop.
-app.set("trust proxy", true);
+app.set("trust proxy", 1);
 app.use(security.securityHeaders());
 app.use(security.globalLimiter);
 // Stripe needs the raw request body to verify its signature, so this route
