@@ -105,13 +105,22 @@ async function recordDepositCreated({ stripeSessionId, phone, amountCents, curre
         );
 }
 
+// Marks a deposit paid, but only transitions it out of a non-paid status -
+// the WHERE clause makes this safe to call twice. Returns true only the
+// first time (when it actually flipped the status), so callers can use that
+// to decide whether to go on and create a Shopify order. Stripe explicitly
+// documents that webhooks can be delivered more than once for the same
+// event, so this is a real scenario, not just theoretical: without this
+// guard, a redelivered "checkout.session.completed" event would create a
+// second Shopify order for the same payment.
 async function markDepositPaid(stripeSessionId, { amountCents, currency }) {
-    if (!pool) return;
-    await pool.query(
+    if (!pool) return false;
+    const { rowCount } = await pool.query(
           `UPDATE deposits SET status = 'paid', paid_at = now(), amount_cents = $2, currency = $3
-               WHERE stripe_session_id = $1`,
+               WHERE stripe_session_id = $1 AND status <> 'paid'`,
           [stripeSessionId, amountCents, currency]
         );
+    return rowCount > 0;
 }
 
 async function recordDepositOrder(stripeSessionId, { shopifyOrderId, shopifyOrderName }) {
