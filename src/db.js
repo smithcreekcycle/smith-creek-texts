@@ -1,4 +1,5 @@
 const { Pool } = require("pg");
+const crypto = require("crypto");
 
 const pool = process.env.DATABASE_URL
   ? new Pool({
@@ -6,6 +7,13 @@ const pool = process.env.DATABASE_URL
           ssl: { rejectUnauthorized: false },
   })
     : null;
+// Login tokens are single-use secrets good for 15 minutes; store only a
+// SHA-256 hash of each one (never the raw value) so a database read on its
+// own - a leaked backup, a stray query - can't be replayed as a valid login,
+// the same reasoning as hashing passwords.
+function hashToken(token) {
+    return crypto.createHash("sha256").update(String(token)).digest("hex");
+}
 
 async function initSchema() {
     if (!pool) return;
@@ -151,7 +159,7 @@ async function createLoginToken(token, email, expiresAt) {
     if (!pool) return;
     await pool.query(
           `INSERT INTO login_tokens (token, email, expires_at) VALUES ($1, $2, $3)`,
-          [token, email, expiresAt]
+            [hashToken(token), email, expiresAt]
         );
 }
 
@@ -163,7 +171,7 @@ async function consumeLoginToken(token) {
           `UPDATE login_tokens SET used_at = now()
                WHERE token = $1 AND used_at IS NULL AND expires_at > now()
                     RETURNING email`,
-          [token]
+          [hashToken(token)]
         );
     return rows[0] ? rows[0].email : null;
 }
