@@ -107,20 +107,38 @@ const LOGIN_ERROR_MESSAGES = {
   send_failed: "Couldn't send the login link right now. Try again in a minute, or contact the site admin.",
   expired: "That login link has expired or was already used. Request a new one below.",
 };
+// Styled to match the Smith Creek Cycle brand (smithcreekcycle.ca): white
+// page, black type, Archivo Black headline font, hard-edged bright-orange
+// button with bold black uppercase text - the same look the storefront
+// uses, not a generic unstyled form.
 function loginPageHtml({ email, sent, error }) {
       const errorMessage = error ? LOGIN_ERROR_MESSAGES[error] || "Something went wrong. Try again." : null;
       return `<!doctype html>
       <html>
-      <head><title>Log in - Smith Creek Texts</title></head>
-      <body style="font-family: sans-serif; max-width: 480px; margin: 60px auto;">
-      <h1 style="color:#FF5A1F;">Smith Creek Texts</h1>
-      ${sent ? `<p style="color:#2ecc71;">If that address is allowed, a login link is on its way. Check the inbox and click the link (it expires in ${auth.TOKEN_TTL_MINUTES} minutes).</p>` : ""}
-      ${errorMessage ? `<p style="color:#c0392b;">${escapeHtml(errorMessage)}</p>` : ""}
-      <form method="POST" action="/login">
-      <label>Email<br>
-      <input type="email" name="email" value="${escapeHtml(email || auth.ALLOWED_LOGIN_EMAIL)}" required style="width:100%; padding:8px;">
-      </label><br><br>
-      <button type="submit" style="padding:10px 20px; background:#FF5A1F; color:white; border:none; border-radius:4px;">Email me a login link</button>
+      <head>
+      <title>Log in - Smith Creek Texts</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <link rel="preconnect" href="https://fonts.googleapis.com">
+      <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+      <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&display=swap" rel="stylesheet">
+      </head>
+      <body style="font-family: -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; background:#fff; color:#111; max-width: 420px; margin: 0 auto; padding: 0 24px;">
+      <div style="margin-top:72px; display:flex; align-items:center; gap:10px;">
+        <div style="display:flex; gap:3px; transform: skewX(-12deg);">
+          <div style="width:6px; height:28px; background:#FF5C00;"></div>
+          <div style="width:6px; height:28px; background:#FF5C00;"></div>
+          <div style="width:6px; height:28px; background:#111;"></div>
+        </div>
+        <span style="font-family:'Archivo Black', sans-serif; font-size:22px; letter-spacing:0.5px; white-space:nowrap;">SMITH CREEK CYCLE</span>
+      </div>
+      <p style="color:#FF5C00; font-weight:700; letter-spacing:3px; text-transform:uppercase; font-size:12px; margin: 28px 0 4px;">Staff login</p>
+      <h1 style="font-family:'Archivo Black', sans-serif; font-size:28px; margin: 0 0 24px; line-height:1.15;">Smith Creek Texts</h1>
+      ${sent ? `<p style="background:#111; color:#fff; padding:12px 14px; font-size:14px; line-height:1.4;">If that address is allowed, a login link is on its way. Check the inbox and click the link (it expires in ${auth.TOKEN_TTL_MINUTES} minutes).</p>` : ""}
+      ${errorMessage ? `<p style="background:#c0392b; color:#fff; padding:12px 14px; font-size:14px; line-height:1.4;">${escapeHtml(errorMessage)}</p>` : ""}
+      <form method="POST" action="/login" style="margin-top: 8px;">
+      <label style="display:block; font-weight:700; font-size:13px; letter-spacing:0.5px; margin-bottom:6px;">Email</label>
+      <input type="email" name="email" value="${escapeHtml(email || auth.ALLOWED_LOGIN_EMAIL)}" required style="width:100%; box-sizing:border-box; padding:12px; font-size:15px; border:2px solid #111; border-radius:0; margin-bottom:18px;">
+      <button type="submit" style="width:100%; padding:14px 20px; background:#FF5C00; color:#111; font-weight:700; letter-spacing:2px; text-transform:uppercase; font-size:13px; border:none; border-radius:0; cursor:pointer;">Email me a login link</button>
       </form>
       </body>
       </html>`;
