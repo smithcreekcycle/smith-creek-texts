@@ -193,11 +193,11 @@ async function start() {
                                     });
           });
   });
-  app.post("/logout", (req, res) => {
+  app.post("/logout", security.verifyCsrf, (req, res) => {
           req.session.destroy(() => res.redirect("/login"));
   });
   // ---- Staff-facing pages: Canada-only AND logged in ----
-  app.get("/", auth.requireCanada, auth.requireAuth, (_req, res) => {
+  app.get("/", auth.requireCanada, auth.requireAuth, (req, res) => {
           res.type("html").send(`
           <!doctype html>
           <html>
@@ -208,7 +208,10 @@ async function start() {
           the real texting inbox once Twilio is connected.</p>
           <p>Status: <a href="/health">/health</a></p>
           <p><a href="/inbox/needs-reply">Needs reply</a> &middot; <a href="/payments">Payment links</a></p>
-          <form method="POST" action="/logout"><button type="submit">Log out</button></form>
+          <form method="POST" action="/logout">
+          <input type="hidden" name="_csrf" value="${escapeHtml(security.csrfToken(req))}">
+          <button type="submit">Log out</button>
+          </form>
           </body>
           </html>
           `);
@@ -224,9 +227,10 @@ async function start() {
           }
   });
   // Simple staff-facing screen: who still needs a reply, across SMS and voicemail.
-  app.get("/inbox/needs-reply", auth.requireCanada, auth.requireAuth, async (_req, res) => {
+  app.get("/inbox/needs-reply", auth.requireCanada, auth.requireAuth, async (req, res) => {
           try {
                     const items = await needsReply.getAllNeedingReply();
+                    const csrfField = `<input type="hidden" name="_csrf" value="${escapeHtml(security.csrfToken(req))}">`;
                     const rows = items.map(function (i) {
                                 const preview = i.channel === "voicemail"
                                   ? (i.lastMessage ? `<a href="${escapeHtml(i.lastMessage)}">listen</a>` : "(no recording)")
@@ -239,6 +243,7 @@ async function start() {
                                                                                   <td>
                                                                                               <form method="POST" action="/inbox/needs-reply/resolve">
                                                                                                             <input type="hidden" name="number" value="${escapeHtml(i.number)}">
+                                                                                                                                                                                                                              ${csrfField}
                                                                                                                                                                                                                               <button type="submit">Mark handled</button>
                                                                                                                                                                                                                                           </form>
                                                                                                                                                                                                                                                     </td>
@@ -261,7 +266,7 @@ async function start() {
                     res.status(500).send(`Failed to load needs-reply list: ${escapeHtml(err.message)}`);
           }
   });
-  app.post("/inbox/needs-reply/resolve", auth.requireCanada, auth.requireAuth, async (req, res) => {
+  app.post("/inbox/needs-reply/resolve", auth.requireCanada, auth.requireAuth, security.verifyCsrf, async (req, res) => {
           const { number } = req.body || {};
           try {
                                     if (number) await db.markResolved(number);
@@ -280,6 +285,7 @@ async function start() {
           <h1 style="color:#FF5A1F;">Send a payment link</h1>
           <p><a href="/inbox/needs-reply">Needs reply</a> &middot; <a href="/payments">Payment history</a></p>
           <form method="POST" action="/payments/send">
+          <input type="hidden" name="_csrf" value="${escapeHtml(security.csrfToken(req))}">
           <label>Phone number<br>
           <input type="text" name="phone" value="${escapeHtml(phone)}" placeholder="+12505551234" required style="width:100%; padding:8px;">
           </label><br><br>
@@ -294,7 +300,7 @@ async function start() {
           </body>
           </html>`);
   });
-  app.post("/payments/send", auth.requireCanada, auth.requireAuth, security.staffActionLimiter, async (req, res) => {
+  app.post("/payments/send", auth.requireCanada, auth.requireAuth, security.staffActionLimiter, security.verifyCsrf, async (req, res) => {
           const { data, error: validationError } = validate(sendPaymentLinkSchema, req.body || {});
           if (validationError) {
                     return res.status(400).send(`<!doctype html>

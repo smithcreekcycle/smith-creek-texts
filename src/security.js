@@ -4,6 +4,7 @@
 // well-understood thing (verify a signature, cap a rate, set a header) so a
 // reviewer can audit the whole security posture of the app in one place.
 
+const crypto = require("crypto");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const twilio = require("twilio");
@@ -109,6 +110,54 @@ function requireTwilioSignature(req, res, next) {
   next();
 }
 
+// ---- CSRF protection for staff-facing forms --------------------------------
+//
+// Synchronizer token pattern: each authenticated session gets one random
+// token stored server-side (in the session itself, which already lives in
+// Postgres via connect-pg-simple). Every staff form embeds it as a hidden
+// field; every state-changing staff POST checks it matches before doing
+// anything. The session cookie's `sameSite: lax` already blocks most
+// cross-site POSTs in modern browsers, but that's a browser behavior we're
+// relying on, not a control this app enforces itself - a real token closes
+// the gap for older/misconfigured clients and is the standard defense here.
+//
+// Login/logout aren't included: logging in isn't a session-authenticated
+// action yet (there's no token to check against), and the one state change
+// a forged logout could cause is forcibly logging the single staff user
+// out - mildly annoying, not a security issue - so this focuses on the
+// routes that actually move money or change stored data.
+function csrfToken(req) {
+    if (!req.session.csrfToken) {
+          req.session.csrfToken = crypto.randomBytes(32).toString("hex");
+    }
+    return req.session.csrfToken;
+}
+
+function verifyCsrf(req, res, next) {
+    const expected = req.session && req.session.csrfToken;
+    const provided = req.body && req.body._csrf;
+    const valid =
+          typeof expected === "string" &&
+          typeof provided === "string" &&
+          expected.length === provided.length &&
+          crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
+
+    if (!valid) {
+          console.warn("Rejected a request with a missing or invalid CSRF token", {
+                path: req.path,
+                ip: req.ip,
+          });
+          return res
+                .status(403)
+                .type("html")
+                .send(
+                      "<!doctype html><title>Forbidden</title><p>Your session may have expired, or this form was submitted from somewhere it shouldn't have been. Go back and try again.</p>"
+                );
+    }
+
+    next();
+}
+
 module.exports = {
     securityHeaders,
     loginRequestLimiter,
@@ -116,4 +165,6 @@ module.exports = {
     staffActionLimiter,
     globalLimiter,
     requireTwilioSignature,
+    csrfToken,
+    verifyCsrf,
 };
