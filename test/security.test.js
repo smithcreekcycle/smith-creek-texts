@@ -106,3 +106,69 @@ test("requireTwilioSignature fails closed when TWILIO_AUTH_TOKEN is not configur
        assert.equal(nextCalled, false, "with no auth token configured, nothing can be verified, so nothing is trusted");
     assert.equal(statusCode, 403);
 });
+
+// ---- csrfToken / verifyCsrf -------------------------------------------------
+
+function fakeCsrfReqRes({ session, body }) {
+    const req = { session, body, path: "/payments/send", ip: "203.0.113.5" };
+    let statusCode = null;
+    const res = {
+          status(code) {
+                  statusCode = code;
+                  return res;
+          },
+          type() {
+                  return res;
+          },
+          send() {
+                  return res;
+          },
+    };
+    let nextCalled = false;
+    const next = () => {
+          nextCalled = true;
+    };
+    security.verifyCsrf(req, res, next);
+    return { statusCode, nextCalled };
+}
+
+test("csrfToken generates a token once and reuses it on later calls", () => {
+    const session = {};
+    const first = security.csrfToken({ session });
+    const second = security.csrfToken({ session });
+
+       assert.equal(typeof first, "string");
+    assert.ok(first.length >= 32, "token should be long enough to resist guessing");
+    assert.equal(first, second, "the same session should keep the same token rather than rotating it every request");
+});
+
+test("verifyCsrf accepts a request whose body token matches the session token", () => {
+    const session = { csrfToken: "a".repeat(64) };
+    const { statusCode, nextCalled } = fakeCsrfReqRes({ session, body: { _csrf: session.csrfToken } });
+
+       assert.equal(nextCalled, true);
+    assert.equal(statusCode, null);
+});
+
+test("verifyCsrf rejects a missing token", () => {
+    const session = { csrfToken: "a".repeat(64) };
+    const { statusCode, nextCalled } = fakeCsrfReqRes({ session, body: {} });
+
+       assert.equal(nextCalled, false);
+    assert.equal(statusCode, 403);
+});
+
+test("verifyCsrf rejects a token that doesn't match the session's", () => {
+    const session = { csrfToken: "a".repeat(64) };
+    const { statusCode, nextCalled } = fakeCsrfReqRes({ session, body: { _csrf: "b".repeat(64) } });
+
+       assert.equal(nextCalled, false);
+    assert.equal(statusCode, 403);
+});
+
+test("verifyCsrf rejects when there is no session token to check against", () => {
+    const { statusCode, nextCalled } = fakeCsrfReqRes({ session: {}, body: { _csrf: "a".repeat(64) } });
+
+       assert.equal(nextCalled, false);
+    assert.equal(statusCode, 403);
+});
