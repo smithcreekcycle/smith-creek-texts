@@ -15,9 +15,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
 
-      - run: npm ci
+      # No package-lock.json is committed yet, so `npm ci` and the
+      # `cache: npm` option above both fail before a single test runs
+      # (every CI run so far has failed in ~15s for exactly this reason -
+      # see git history). `npm install` works without a lockfile as a
+      # stopgap, but it means dependency versions aren't pinned and can
+      # drift between runs. Generating and committing package-lock.json
+      # (`npm install` once, commit the result) restores reproducible
+      # builds, npm's --audit-level=high checking actually against locked
+      # versions, and re-enables `npm ci` + `cache: npm` above.
+      - run: npm install
 
       - name: Run tests
         run: npm test
