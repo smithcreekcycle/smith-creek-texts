@@ -1,692 +1,263 @@
+// Entry point: checks configuration, wires the pieces together, and starts
+// listening. No business logic lives here - see:
+//
+//   deposits.js              the payment-link / paid-deposit workflow
+//   storeCredit.js           deposits held as Shopify store credit (text + POS)
+//   helcimPayments.js        payment processor API client + webhook verification
+//   routes/paymentWebhooks   processor webhooks (raw body, signature-verified)
+//   routes/shopifyWebhooks   Shopify order/refund webhooks (raw body, signature-verified)
+//   routes/twilioWebhooks    Twilio webhooks (signature-verified)
+//   routes/login             passwordless staff login
+//   routes/staff             staff pages (geo-restricted, logged in, CSRF)
+//   views.js                 all HTML
+//   security.js / auth.js    headers, rate limits, signatures, CSRF, sessions
+
 require("dotenv").config();
-const crypto = require("crypto");
 const express = require("express");
 const session = require("express-session");
 const PgSession = require("connect-pg-simple")(session);
-const { getAccessToken } = require("./shopify");
-const twilio = require("twilio");
+
 const db = require("./db");
-const needsReply = require("./needsReply");
-// Stripe is no longer used to send payment links (see helcimPayments below),
-// but the module and its webhook route are kept in place, dormant, as a
-// backup in case Helcim needs to be rolled back.
-const stripePayments = require("./stripePayments");
-const helcimPayments = require("./helcimPayments");
-const shopifyOrders = require("./shopifyOrders");
-const sms = require("./sms");
 const auth = require("./auth");
 const security = require("./security");
-const { sendPaymentLinkSchema, validate } = require("./validation");
-// ---- Fail fast on missing configuration ------------------------------------
-//
+const views = require("./views");
+const sms = require("./sms");
+const shopifyOrders = require("./shopifyOrders");
+const shopifyStoreCredit = require("./shopifyStoreCredit");
+const shopifyWebhooks = require("./shopifyWebhooks");
+const helcimPayments = require("./helcimPayments");
+// Stripe no longer sends payment links. The module and its webhook stay in
+// place, dormant, as a backup in case the processor switch is rolled back.
+const stripePayments = require("./stripePayments");
+const { createDepositService } = require("./deposits");
+const { createStoreCreditService } = require("./storeCredit");
+const createPaymentWebhookRouter = require("./routes/paymentWebhooks");
+const createShopifyWebhookRouter = require("./routes/shopifyWebhooks");
+const createTwilioWebhookRouter = require("./routes/twilioWebhooks");
+const createLoginRouter = require("./routes/login");
+const createStaffRouter = require("./routes/staff");
+
+const PORT = process.env.PORT || 3000;
+
+// How often the app re-checks its Shopify webhook subscriptions and sweeps
+// for deposit orders a webhook didn't tell it about.
+const BACKGROUND_INTERVAL_MS = 30 * 60 * 1000;
+
 // A missing DATABASE_URL doesn't fail loudly on its own - db.js quietly
-// no-ops every query, and express-session's Postgres store throws a
-// confusing error the first time anyone hits a session-backed route. Better
-// to refuse to start at all with a message that says exactly what's wrong.
-// Everything else here is optional at boot (Twilio/Stripe/Shopify/SMTP each
-// guard their own missing config and fail only when actually used), so we
-// only hard-require what the app cannot run at all without.
+// no-ops every query and the session store throws something confusing on the
+// first request. Refuse to start instead, with a message that says exactly
+// what's wrong. Everything else is optional at boot: Twilio, the payment
+// processor, Shopify and SMTP each fail only when actually used.
 function assertRequiredEnv() {
-  const required = ["DATABASE_URL"];
-  const missing = required.filter((key) => !process.env[key]);
+  const missing = ["DATABASE_URL"].filter((key) => !process.env[key]);
   if (missing.length > 0) {
     throw new Error(
-      `Missing required environment variable(s): ${missing.join(", ")}. The app cannot start without them.`
+      `Missing required environment variable(s): ${missing.join(", ")}. The app cannot start without them.`,
     );
   }
 }
-// Catches anything that slips past the try/catch blocks in individual route
-// handlers. Render restarts the process automatically after a crash, so
-// exiting on an uncaught exception trades a few seconds of downtime for not
-// running on potentially corrupted in-memory state. A rejected promise with
-// no .catch() is logged but doesn't crash the process by itself - Node
-// itself will start doing that in a future major version, so this also
-// keeps behaviour predictable regardless of Node version.
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught exception - exiting so Render can restart cleanly", err);
-  process.exit(1);
-});
-process.on("unhandledRejection", (reason) => {
-  console.error("Unhandled promise rejection", reason);
-});
-const app = express();
-// Render sits in front of this app as a reverse proxy. Trusting it lets
-// Express read the real client IP (for the Canada-only check and rate
-// limiting) and the real protocol from X-Forwarded-* headers instead of
-// Render's own internal hop.
-app.set("trust proxy", 1);
-app.use(security.securityHeaders());
-app.use(security.globalLimiter);
-// Stripe needs the raw request body to verify its signature, so this route
-// is registered before the urlencoded/json body parsers below touch the
-// request stream. express.raw's own size limit also protects this route
-// before signature verification even runs.
-app.post(
-      "/webhooks/stripe",
-      express.raw({ type: "application/json", limit: "1mb" }),
-      async (req, res) => {
-              const stripe = stripePayments.getClient();
-              const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
-              if (!stripe || !webhookSecret) {
-                        console.error("Stripe webhook received but Stripe is not configured");
-                        return res.sendStatus(500);
-              }
-        let event;
-              try {
-                        event = stripe.webhooks.constructEvent(
-                                    req.body,
-                                    req.headers["stripe-signature"],
-                                    webhookSecret
-                                  );
-              } catch (err) {
-                        console.error("Stripe webhook signature verification failed", err.message);
-                                            return res.sendStatus(400);
-              }
-        if (event.type === "checkout.session.completed") {
-                  const session = event.data.object;
-                  try {
-                              await handleCheckoutCompleted(session);
-                  } catch (err) {
-                              console.error("Failed to handle Stripe checkout completion", err.message);
-                  }
-        }
-        res.sendStatus(200);
-      }
+
+// Things that won't stop the app from starting but will bite later. Said
+// once, loudly, at boot - names only, never values.
+function warnAboutConfig() {
+  if (!process.env.APP_SECRET) {
+    console.warn(
+      "APP_SECRET is not set: using a random session secret, so everyone is logged out every time the app restarts.",
     );
-// Helcim's webhooks follow the Standard Webhooks spec: HMAC-SHA256 over
-// `${webhook-id}.${webhook-timestamp}.${rawBody}`, keyed by the base64-decoded
-// verifierToken from the Helcim dashboard (All Tools > Integrations >
-// Webhooks). Like the Stripe route above, this needs the raw body, so it's
-// registered before the body parsers.
-app.post(
-  "/webhooks/helcim",
-  express.raw({ type: "application/json", limit: "1mb" }),
-  async (req, res) => {
-    const verifierToken = process.env.HELCIM_WEBHOOK_VERIFIER_TOKEN;
-    if (!verifierToken) {
-      console.error("Helcim webhook received but HELCIM_WEBHOOK_VERIFIER_TOKEN is not configured");
-      return res.sendStatus(500);
-    }
-
-    const webhookId = req.headers["webhook-id"];
-    const webhookTimestamp = req.headers["webhook-timestamp"];
-    const webhookSignature = req.headers["webhook-signature"];
-    if (!webhookId || !webhookTimestamp || !webhookSignature) {
-      console.error("Helcim webhook missing required headers");
-      return res.sendStatus(400);
-    }
-
-    try {
-      const signedContent = `${webhookId}.${webhookTimestamp}.${req.body.toString("utf8")}`;
-      const verifierTokenBytes = Buffer.from(verifierToken, "base64");
-      const expectedSignature = crypto
-        .createHmac("sha256", verifierTokenBytes)
-        .update(signedContent)
-        .digest("base64");
-
-      // webhook-signature can carry multiple space-separated "v1,<sig>"
-      // values; check ours against all of them rather than assuming the
-      // first is the right scheme/version.
-      const providedSignatures = String(webhookSignature)
-        .split(" ")
-        .map((part) => part.split(",")[1])
-        .filter(Boolean);
-      const isValid = providedSignatures.some((sig) => {
-        try {
-          return crypto.timingSafeEqual(Buffer.from(sig, "base64"), Buffer.from(expectedSignature, "base64"));
-        } catch (e) {
-          return false;
-        }
-      });
-      if (!isValid) {
-        console.error("Helcim webhook signature verification failed");
-        return res.sendStatus(400);
-      }
-    } catch (err) {
-      console.error("Helcim webhook signature verification error", err.message);
-      return res.sendStatus(400);
-    }
-
-    let event;
-    try {
-      event = JSON.parse(req.body.toString("utf8"));
-    } catch (err) {
-      console.error("Helcim webhook body was not valid JSON", err.message);
-      return res.sendStatus(400);
-    }
-
-    // Helcim's only documented event type today is "cardTransaction" - fired
-    // for both approved and declined attempts. The body is thin (mostly
-    // IDs), so handleHelcimInvoicePaid re-fetches the invoice from the API
-    // rather than trusting amount/status fields that may or may not be on
-    // the webhook payload itself.
-    console.log("[helcim] webhook received", JSON.stringify(event));
-    const invoiceNumber = event && event.data && (event.data.invoiceNumber || event.data.invoice_number);
-    if (event && event.type === "cardTransaction" && invoiceNumber) {
-      try {
-        await handleHelcimInvoicePaid(String(invoiceNumber));
-      } catch (err) {
-        console.error("Failed to handle Helcim invoice payment", err.message);
-      }
-    }
-    res.sendStatus(200);
   }
-);
-// Twilio posts form-encoded; everything else that takes a body is JSON or a
-// browser form post. A 100kb cap is generous for anything this app actually
-// receives and rejects an oversized body before it's fully buffered.
-app.use(express.urlencoded({ extended: false, limit: "100kb" }));
-app.use(express.json({ limit: "100kb" }));
-const PORT = process.env.PORT || 3000;
-function escapeHtml(str) {
-      return String(str == null ? "" : str).replace(/[&<>"']/g, function (c) {
-              return { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" }[c];
-      });
+  const paymentVars = ["HELCIM_API_TOKEN", "HELCIM_SUBDOMAIN", "HELCIM_WEBHOOK_VERIFIER_TOKEN"];
+  const missingPayment = paymentVars.filter((key) => !process.env[key]);
+  if (missingPayment.length > 0) {
+    console.warn(`Payment links are not fully configured. Missing: ${missingPayment.join(", ")}`);
+  } else if (!helcimPayments.getConfig()) {
+    console.warn("HELCIM_SUBDOMAIN doesn't look like a subdomain (it should be just the part before .myhelcim.com).");
+  }
+  if (!shopifyConfigured()) {
+    console.warn(
+      "Shopify is not fully configured (SHOPIFY_STORE_DOMAIN / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET): deposits can't be put on customer accounts.",
+    );
+  }
 }
-// error is always a short fixed code (never raw error text - see the /login
-// POST handler below), so this is safe to render without worrying that an
-// internal error message leaks something like a hostname to an
-// unauthenticated visitor.
-const LOGIN_ERROR_MESSAGES = {
-  send_failed: "Couldn't send the login link right now. Try again in a minute, or contact the site admin.",
-  expired: "That login link has expired or was already used. Request a new one below.",
-};
-// Styled to match the Smith Creek Cycle brand (smithcreekcycle.ca): white
-// page, black type, Archivo Black headline font, hard-edged bright-orange
-// button with bold black uppercase text - the same look the storefront
-// uses, not a generic unstyled form.
-function loginPageHtml({ email, sent, error }) {
-      const errorMessage = error ? LOGIN_ERROR_MESSAGES[error] || "Something went wrong. Try again." : null;
-      return `<!doctype html>
-      <html>
-      <head>
-      <title>Log in - Smith Creek Texts</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <link rel="preconnect" href="https://fonts.googleapis.com">
-      <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-      <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&display=swap" rel="stylesheet">
-      </head>
-      <body style="font-family: -apple-system, 'Segoe UI', Roboto, Arial, sans-serif; background:#fff; color:#111; max-width: 420px; margin: 0 auto; padding: 0 24px;">
-      <div style="margin-top:72px; display:flex; align-items:center; gap:10px;">
-        <div style="display:flex; gap:3px; transform: skewX(-12deg);">
-          <div style="width:6px; height:28px; background:#FF5C00;"></div>
-          <div style="width:6px; height:28px; background:#FF5C00;"></div>
-          <div style="width:6px; height:28px; background:#111;"></div>
-        </div>
-        <span style="font-family:'Archivo Black', sans-serif; font-size:22px; letter-spacing:0.5px; white-space:nowrap;">SMITH CREEK CYCLE</span>
-      </div>
-      <p style="color:#FF5C00; font-weight:700; letter-spacing:3px; text-transform:uppercase; font-size:12px; margin: 28px 0 4px;">Staff login</p>
-      <h1 style="font-family:'Archivo Black', sans-serif; font-size:28px; margin: 0 0 24px; line-height:1.15;">Smith Creek Texts</h1>
-      ${sent ? `<p style="background:#111; color:#fff; padding:12px 14px; font-size:14px; line-height:1.4;">If that address is allowed, a login link is on its way. Check the inbox and click the link (it expires in ${auth.TOKEN_TTL_MINUTES} minutes).</p>` : ""}
-      ${errorMessage ? `<p style="background:#c0392b; color:#fff; padding:12px 14px; font-size:14px; line-height:1.4;">${escapeHtml(errorMessage)}</p>` : ""}
-      <form method="POST" action="/login" style="margin-top: 8px;">
-      <label style="display:block; font-weight:700; font-size:13px; letter-spacing:0.5px; margin-bottom:6px;">Email</label>
-      <input type="email" name="email" value="${escapeHtml(email || auth.ALLOWED_LOGIN_EMAIL)}" required style="width:100%; box-sizing:border-box; padding:12px; font-size:15px; border:2px solid #111; border-radius:0; margin-bottom:18px;">
-      <button type="submit" style="width:100%; padding:14px 20px; background:#FF5C00; color:#111; font-weight:700; letter-spacing:2px; text-transform:uppercase; font-size:13px; border:none; border-radius:0; cursor:pointer;">Email me a login link</button>
-      </form>
-      </body>
-      </html>`;
+
+function shopifyConfigured() {
+  return ["SHOPIFY_STORE_DOMAIN", "SHOPIFY_CLIENT_ID", "SHOPIFY_CLIENT_SECRET"].every((key) => process.env[key]);
 }
-// Everything below needs the DB (for sessions + login tokens) ready first.
-async function start() {
-      assertRequiredEnv();
-      await db.initSchema();
-  app.use(
-          session({
-                    store: new PgSession({ pool: db.pool, createTableIfMissing: true }),
-                    secret: auth.getSessionSecret(),
-                    resave: false,
-                    saveUninitialized: false,
-                    name: "sct.sid",
-                    cookie: {
-                                maxAge: auth.SESSION_MAX_AGE_MS,
-                                httpOnly: true,
-                                secure: true,
-                                sameSite: "lax",
-                    },
-          })
-        );
-  // ---- Fully public: Render's own health check ----
+
+// The two services that hold the business rules. Built once and shared by
+// the routes and the background tasks.
+function createServices() {
+  const storeCredit = createStoreCreditService({ db, shopifyOrders, shopifyStoreCredit });
+  const deposits = createDepositService({ db, payments: helcimPayments, shopifyOrders, storeCredit, sms });
+  return { storeCredit, deposits };
+}
+
+function buildApp({ deposits, storeCredit } = createServices()) {
+  const app = express();
+
+  // Render sits in front of this app as a reverse proxy. Trusting it lets
+  // Express read the client IP (geo check, rate limiting) and the real
+  // protocol from X-Forwarded-* instead of Render's own internal hop.
+  app.set("trust proxy", 1);
+  app.use(security.securityHeaders());
+  app.use(security.globalLimiter);
+
+  // Render's health check. Public, and ahead of everything that could touch
+  // the database, so a health probe never costs a query.
   app.get("/health", (_req, res) => {
-          res.json({ ok: true, time: new Date().toISOString() });
+    res.json({ ok: true, time: new Date().toISOString() });
   });
-  // ---- Login flow: Canada-only, but doesn't require being logged in yet ----
-  app.get("/login", auth.requireCanada, (req, res) => {
-          const error = req.query.error === "1" ? "send_failed" : null;
-          res.type("html").send(
-                    loginPageHtml({ sent: req.query.sent === "1", error })
-                  );
-  });
-  app.post("/login", auth.requireCanada, security.loginRequestLimiter, async (req, res) => {
-          try {
-                    await auth.requestLoginLink(req.body && req.body.email);
-                    res.redirect("/login?sent=1");
-          } catch (err) {
-                    // Log the real reason server-side only - an unauthenticated visitor
-                    // never needs to see internal details like an SMTP hostname.
-                    console.error("Failed to send login link", err.message);
-                    res.redirect("/login?error=1");
-          }
-  });
-  app.get("/login/verify", auth.requireCanada, security.loginVerifyLimiter, async (req, res) => {
-          const email = await auth.verifyToken(req.query.token);
-          if (!email) {
-                    return res
-                      .status(400)
-                      .type("html")
-                      .send(loginPageHtml({ error: "expired" }));
-          }
-          // Prevent session fixation: issue a brand new session id on login
-          // rather than reusing whatever session (if any) the visitor already
-          // had, so a session id captured before authentication is useless
-          // afterward.
-          req.session.regenerate((err) => {
-                    if (err) {
-                              console.error("Failed to regenerate session on login", err.message);
-                              return res.status(500).type("html").send(loginPageHtml({ error: "send_failed" }));
-                    }
-                    req.session.authedEmail = email;
-                                    req.session.save((saveErr) => {
-                              if (saveErr) {
-                                        console.error("Failed to save session on login", saveErr.message);
-                                        return res.status(500).type("html").send(loginPageHtml({ error: "send_failed" }));
-                              }
-                              res.redirect("/");
-                                    });
-          });
-  });
-  app.post("/logout", security.verifyCsrf, (req, res) => {
-          req.session.destroy(() => res.redirect("/login"));
-  });
-  // ---- Staff-facing pages: Canada-only AND logged in ----
-  app.get("/", auth.requireCanada, auth.requireAuth, (req, res) => {
-          res.type("html").send(`
-          <!doctype html>
-          <html>
-          <head><title>Smith Creek Texts</title></head>
-          <body style="font-family: sans-serif; max-width: 640px; margin: 60px auto; color: #111;">
-          <h1 style="color:#FF5A1F;">Smith Creek Texts</h1>
-          <p>The app is deployed and running. This placeholder page will become
-          the real texting inbox once Twilio is connected.</p>
-          <p>Status: <a href="/health">/health</a></p>
-          <p><a href="/inbox/needs-reply">Needs reply</a> &middot; <a href="/payments">Payment links</a></p>
-          <form method="POST" action="/logout">
-          <input type="hidden" name="_csrf" value="${escapeHtml(security.csrfToken(req))}">
-          <button type="submit">Log out</button>
-          </form>
-          </body>
-          </html>
-          `);
-  });
-  // Quick manual check that the Shopify client-credentials grant actually works
-  // once SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET are set as real env vars here.
-  app.get("/health/shopify", auth.requireCanada, auth.requireAuth, async (_req, res) => {
-          try {
-                    await getAccessToken();
-                    res.json({ ok: true });
-          } catch (err) {
-                    res.status(500).json({ ok: false, error: err.message });
-          }
-  });
-  // Simple staff-facing screen: who still needs a reply, across SMS and voicemail.
-  app.get("/inbox/needs-reply", auth.requireCanada, auth.requireAuth, async (req, res) => {
-          try {
-                    const items = await needsReply.getAllNeedingReply();
-                    const csrfField = `<input type="hidden" name="_csrf" value="${escapeHtml(security.csrfToken(req))}">`;
-                    const rows = items.map(function (i) {
-                                const preview = i.channel === "voicemail"
-                                  ? (i.lastMessage ? `<a href="${escapeHtml(i.lastMessage)}">listen</a>` : "(no recording)")
-                                              : escapeHtml(i.lastMessage || "");
-                                return `<tr>
-                                          <td>${escapeHtml(i.channel)}</td>
-                                                    <td>${escapeHtml(i.number)}</td>
-                                                              <td>${new Date(i.receivedAt).toLocaleString()}</td>
-                                                                        <td>${preview}</td>
-                                                                                  <td>
-                                                                                              <form method="POST" action="/inbox/needs-reply/resolve">
-                                                                                                            <input type="hidden" name="number" value="${escapeHtml(i.number)}">
-                                                                                                                                                                                                                              ${csrfField}
-                                                                                                                                                                                                                              <button type="submit">Mark handled</button>
-                                                                                                                                                                                                                                          </form>
-                                                                                                                                                                                                                                                    </td>
-                                                                                                                                                                                                                                                              <td><a href="/payments/send?phone=${encodeURIComponent(i.number)}">Send payment link</a></td>
-                                                                                                                                                                                                                                                                      </tr>`;
-                    }).join("");
-            res.type("html").send(`<!doctype html>
-            <html>
-            <head><title>Needs Reply - Smith Creek Texts</title></head>
-            <body style="font-family: sans-serif; max-width: 900px; margin: 40px auto;">
-            <h1 style="color:#FF5A1F;">Needs a reply (${items.length})</h1>
-            <p><a href="/">Home</a> &middot; <a href="/payments">Payment history</a></p>
-            <table border="1" cellpadding="8" style="border-collapse: collapse; width: 100%;">
-            <tr><th>Channel</th><th>From</th><th>Received</th><th>Message</th><th></th><th></th></tr>
-            ${rows}
-            </table>
-            </body>
-            </html>`);
-          } catch (err) {
-                    res.status(500).send(`Failed to load needs-reply list: ${escapeHtml(err.message)}`);
-          }
-  });
-  app.post("/inbox/needs-reply/resolve", auth.requireCanada, auth.requireAuth, security.verifyCsrf, async (req, res) => {
-          const { number } = req.body || {};
-          try {
-                                    if (number) await db.markResolved(number);
-          } catch (err) {
-                    console.error("Failed to mark resolved", err.message);
-          }
-          res.redirect("/inbox/needs-reply");
-  });
-  // Staff-facing form to text a payment link to a customer.
-  app.get("/payments/send", auth.requireCanada, auth.requireAuth, (req, res) => {
-          const phone = req.query.phone || "";
-          res.type("html").send(`<!doctype html>
-          <html>
-          <head><title>Send Payment Link - Smith Creek Texts</title></head>
-          <body style="font-family: sans-serif; max-width: 480px; margin: 60px auto;">
-          <h1 style="color:#FF5A1F;">Send a payment link</h1>
-          <p><a href="/inbox/needs-reply">Needs reply</a> &middot; <a href="/payments">Payment history</a></p>
-          <form method="POST" action="/payments/send">
-          <input type="hidden" name="_csrf" value="${escapeHtml(security.csrfToken(req))}">
-          <label>Phone number<br>
-          <input type="text" name="phone" value="${escapeHtml(phone)}" placeholder="+12505551234" required style="width:100%; padding:8px;">
-          </label><br><br>
-          <label>Amount (CAD)<br>
-          <input type="number" name="amount" step="0.01" min="0.50" placeholder="50.00" required style="width:100%; padding:8px;">
-          </label><br><br>
-          <label>Note (shows on the receipt, e.g. bike model)<br>
-          <input type="text" name="note" placeholder="Trek Fuel EX deposit" style="width:100%; padding:8px;">
-          </label><br><br>
-          <button type="submit" style="padding:10px 20px; background:#FF5A1F; color:white; border:none; border-radius:4px;">Create &amp; text link</button>
-          </form>
-          </body>
-          </html>`);
-  });
-  app.post("/payments/send", auth.requireCanada, auth.requireAuth, security.staffActionLimiter, security.verifyCsrf, async (req, res) => {
-          const { data, error: validationError } = validate(sendPaymentLinkSchema, req.body || {});
-          if (validationError) {
-                    return res.status(400).send(`<!doctype html>
-                    <html><body style="font-family: sans-serif; max-width: 480px; margin: 60px auto;">
-                    <h1 style="color:#c0392b;">Couldn't send link</h1>
-                    <p>${escapeHtml(validationError)}</p>
-                    <p><a href="/payments/send">Try again</a></p>
-                    </body></html>`);
-          }
-          const { phone, note } = data;
-          try {
-                    const amountCents = Math.round(data.amount * 100);
-                    const invoice = await helcimPayments.createDepositInvoice({ phone, amountCents, note });
-                    await db.recordHelcimDepositCreated({
-                                helcimInvoiceNumber: invoice.invoiceNumber,
-                                helcimToken: invoice.token,
-                                phone,
-                                amountCents,
-                                currency: "CAD",
-                                                          note: note || "",
-                    });
-                    await sms.sendSms(
-                                phone,
-                                `Smith Creek Cycle: here's your secure payment link${note ? ` for ${note}` : ""}: ${invoice.url}`
-                              );
-                    res.type("html").send(`<!doctype html>
-                    <html><body style="font-family: sans-serif; max-width: 480px; margin: 60px auto;">
-                    <h1 style="color:#FF5A1F;">Link sent</h1>
-                    <p>Texted a $${(amountCents / 100).toFixed(2)} payment link to ${escapeHtml(phone)}.</p>
-                    <p><a href="/payments/send">Send another</a> &middot; <a href="/payments">Payment history</a></p>
-                    </body></html>`);
-          } catch (err) {
-                    res.status(400).send(`<!doctype html>
-                    <html><body style="font-family: sans-serif; max-width: 480px; margin: 60px auto;">
-                    <h1 style="color:#c0392b;">Couldn't send link</h1>
-                    <p>${escapeHtml(err.message)}</p>
-                    <p><a href="/payments/send">Try again</a></p>
-                    </body></html>`);
-          }
-  });
-  // Staff-facing history of payment links sent and their Shopify order status.
-  app.get("/payments", auth.requireCanada, auth.requireAuth, async (_req, res) => {
-          try {
-                    const deposits = await db.getRecentDeposits();
-                    const rows = deposits.map(function (d) {
-                                const statusColor = d.status === "paid" ? "#2ecc71" : d.status === "order_failed" ? "#e67e22" : "#999";
-                                const orderCell = d.shopify_order_name
-                                  ? escapeHtml(d.shopify_order_name)
-                                              : (d.status === "order_failed" ? "needs manual entry" : "-");
-                                return `<tr>
-                                          <td>${new Date(d.created_at).toLocaleString()}</td>
-                                                    <td>${escapeHtml(d.phone)}</td>
-                                                              <td>$${(d.amount_cents / 100).toFixed(2)}</td>
-                                                                        <td>${escapeHtml(d.note || "")}</td>
-                                                                                  <td style="color:${statusColor}; font-weight:bold;">${escapeHtml(d.status)}</td>
-                                                                                            <td>${orderCell}</td>
-                                                                                                    </tr>`;
-                    }).join("");
-                    res.type("html").send(`<!doctype html>
-                    <html>
-                    <head><title>Payments - Smith Creek Texts</title></head>
-                    <body style="font-family: sans-serif; max-width: 900px; margin: 40px auto;">
-                    <h1 style="color:#FF5A1F;">Payment links</h1>
-                    <p><a href="/">Home</a> &middot; <a href="/payments/send">Send a new link</a></p>
-                    <table border="1" cellpadding="8" style="border-collapse: collapse; width: 100%;">
-                    <tr><th>Sent</th><th>Phone</th><th>Amount</th><th>Note</th><th>Status</th><th>Shopify order</th></tr>
-                    ${rows}
-                    </table>
-                    </body>
-                    </html>`);
-          } catch (err) {
-                    res.status(500).send(`Failed to load payments: ${escapeHtml(err.message)}`);
-          }
-  });
-  // ---- Customer-facing pages: no login, no geo-restriction. These were the
-  // redirect targets for Stripe Checkout; Helcim's hosted invoice page shows
-  // its own confirmation instead of redirecting back here, so these two
-  // routes are currently unused in the live flow but kept in case that's
-  // ever wired up (or Stripe is reactivated). They stay public so a customer
-  // landing here isn't blocked just because they're travelling outside
-  // Canada. ----
+
+  // Order matters from here down.
+  // 1. Webhooks that verify a signature over the raw body come before the
+  //    parsers: the payment processor's, then Shopify's.
+  app.use(createPaymentWebhookRouter({ deposits, payments: helcimPayments, stripePayments }));
+  app.use(createShopifyWebhookRouter({ db, storeCredit }));
+
+  // 2. Body parsers. Twilio posts form-encoded; everything else is a browser
+  //    form or JSON. 100kb is generous for anything this app receives.
+  app.use(express.urlencoded({ extended: false, limit: "100kb" }));
+  app.use(express.json({ limit: "100kb" }));
+
+  // 3. Twilio webhooks: machine-to-machine, never need a session.
+  app.use(createTwilioWebhookRouter({ db }));
+
+  // 4. Customer-facing pages: no login, no geo-restriction. These were the
+  //    redirect targets for Stripe Checkout and are unused while Stripe is
+  //    dormant (the processor's hosted invoice page shows its own
+  //    confirmation). Public so a customer abroad is never blocked.
   app.get("/payments/success", (_req, res) => {
-          res.type("html").send(`<!doctype html>
-          <html><body style="font-family: sans-serif; max-width: 480px; margin: 60px auto; text-align:center;">
-          <h1 style="color:#FF5A1F;">Payment received</h1>
-          <p>Thanks! Your payment to Smith Creek Cycle was successful. You will get a receipt shortly.</p>
-          </body></html>`);
+    res.type("html").send(
+      views.messagePage({
+        title: "Payment received",
+        heading: "Payment received",
+        headingColor: views.ORANGE,
+        message: "Thanks! Your payment to Smith Creek Cycle was successful. You will get a receipt shortly.",
+      }),
+    );
   });
   app.get("/payments/cancelled", (_req, res) => {
-          res.type("html").send(`<!doctype html>
-          <html><body style="font-family: sans-serif; max-width: 480px; margin: 60px auto; text-align:center;">
-          <h1>Payment cancelled</h1>
-          <p>No charge was made. Contact Smith Creek Cycle if you still need to pay.</p>
-          </body></html>`);
+    res.type("html").send(
+      views.messagePage({
+        title: "Payment cancelled",
+        heading: "Payment cancelled",
+        message: "No charge was made. Contact Smith Creek Cycle if you still need to pay.",
+      }),
+    );
   });
-  // ---- Twilio webhooks: Twilio's own servers call these, not staff or
-  // customers, so they stay public with no login and no geo-restriction. ----
-  // Twilio posts here whenever a customer texts the shop's number.
-  app.post("/webhooks/twilio-sms", security.requireTwilioSignature, async (req, res) => {
-          const { From, Body, MessageSid } = req.body || {};
-          console.log("Incoming SMS", { From, Body, MessageSid });
-               // TODO: store the message, notify staff, run automation rules.
-               // Relay to Hubtiger so job cards stay in sync (see HUBTIGER_INCOMING_SMS_WEBHOOK_URL).
-               const hubtigerUrl = process.env.HUBTIGER_INCOMING_SMS_WEBHOOK_URL;
-          if (hubtigerUrl) {
-                    try {
-                                await fetch(hubtigerUrl, {
-                                              method: "POST",
-                                              headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                                              body: new URLSearchParams(req.body || {}),
-                                });
-                    } catch (err) {
-                                console.error("Failed to relay to Hubtiger", err.message);
-                    }
-          }
-               res.type("text/xml").send("<Response></Response>");
+
+  // 5. Sessions, then everything that needs one.
+  app.use(
+    session({
+      store: new PgSession({ pool: db.pool, createTableIfMissing: true }),
+      secret: auth.getSessionSecret(),
+      resave: false,
+      saveUninitialized: false,
+      name: "sct.sid",
+      cookie: {
+        maxAge: auth.SESSION_MAX_AGE_MS,
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax",
+      },
+    }),
+  );
+  app.use(createLoginRouter());
+  app.use(createStaffRouter({ db, deposits, storeCredit }));
+
+  // 6. Catch-alls, after every real route.
+  app.use((_req, res) => {
+    res.status(404).type("html").send("<!doctype html><title>Not found</title><p>Not found.</p>");
   });
-  // Twilio posts delivery/status updates here.
-  app.post("/webhooks/twilio-status", security.requireTwilioSignature, (req, res) => {
-          console.log("Twilio status callback", req.body);
-          res.sendStatus(200);
+
+  // Central error handler: anything a route threw or rejected with ends up
+  // here instead of Express's default (which can put a stack trace in the
+  // response). Nothing internal ever reaches the client.
+  app.use((err, _req, res, next) => {
+    if (res.headersSent) return next(err);
+    // The body parsers raise ordinary client errors (too large, malformed);
+    // answer those with their own 4xx rather than calling them a crash.
+    const status = Number.isInteger(err && err.status) && err.status >= 400 && err.status < 500 ? err.status : 500;
+    if (status === 500) console.error("Unhandled request error", err);
+    res
+      .status(status)
+      .type("html")
+      .send(
+        status === 500
+          ? "<!doctype html><title>Something went wrong</title><p>Something went wrong. Please try again.</p>"
+          : "<!doctype html><title>Bad request</title><p>That request couldn't be processed.</p>",
+      );
   });
-  // Phone module: toggled with PHONE_MODULE_ENABLED. When off, calls get a
-  // short message instead of the greeting/voicemail flow.
-  app.post("/webhooks/twilio-voice", security.requireTwilioSignature, (req, res) => {
-          const VoiceResponse = twilio.twiml.VoiceResponse;
-          const twiml = new VoiceResponse();
-               if (process.env.PHONE_MODULE_ENABLED !== "true") {
-                         twiml.say("Sorry, phone support isn't available on this number yet. Please text us instead.");
-                         twiml.hangup();
-                         return res.type("text/xml").send(twiml.toString());
-               }
-               twiml.say("Thanks for calling Smith Creek Cycle. Leave a message after the tone and we will text or call you back.");
-          twiml.record({
-                    action: "/webhooks/twilio-voice-recording",
-                    maxLength: 120,
-                    playBeep: true,
-          });
-          twiml.say("We did not receive a recording. Goodbye.");
-          res.type("text/xml").send(twiml.toString());
-  });
-  app.post("/webhooks/twilio-voice-recording", security.requireTwilioSignature, async (req, res) => {
-          const { CallSid, From, To, RecordingUrl, RecordingDuration } = req.body || {};
-          try {
-                    await db.logVoicemail({
-                                callSid: CallSid,
-                                from: From,
-                                to: To,
-                                recordingUrl: RecordingUrl ? `${RecordingUrl}.mp3` : null,
-                                durationSeconds: RecordingDuration ? parseInt(RecordingDuration, 10) : null,
-                    });
-          } catch (err) {
-                    console.error("Failed to log voicemail", err.message);
-          }
-          const VoiceResponse = twilio.twiml.VoiceResponse;
-          const twiml = new VoiceResponse();
-          twiml.say("Thanks, we got your message. Goodbye.");
-          twiml.hangup();
-          res.type("text/xml").send(twiml.toString());
-  });
-  // ---- Catch-alls: must be registered after every real route -----------
-  app.use((req, res) => {
-          res.status(404).type("html").send(
-                    "<!doctype html><title>Not found</title><p>Not found.</p>"
-                  );
-  });
-  // Centralized error handler. Any route that forgot a try/catch, or threw
-  // from synchronous code, ends up here instead of Express's default
-  // behaviour (which can include a stack trace in the response). Nothing
-  // internal - a message, a stack, a query - ever reaches the client.
-  // eslint-disable-next-line no-unused-vars
-  app.use((err, req, res, next) => {
-          console.error("Unhandled request error", err);
-          if (res.headersSent) return next(err);
-          res.status(500).type("html").send(
-                    "<!doctype html><title>Something went wrong</title><p>Something went wrong. Please try again.</p>"
-                  );
-  });
+
+  return app;
+}
+
+// Housekeeping that keeps deposits honest when a webhook goes missing (the
+// app was restarting, Shopify dropped a subscription): make sure the
+// subscriptions exist, then look for recent deposit orders that haven't been
+// dealt with. Runs once at boot and then on a timer. Never throws - a
+// Shopify outage must not take the texting inbox down with it.
+function startBackgroundTasks({ storeCredit }) {
+  if (!shopifyConfigured()) return Promise.resolve();
+  let running = false;
+  async function run() {
+    if (running) return;
+    running = true;
+    try {
+      const subs = await shopifyWebhooks.ensureSubscriptions({ baseUrl: auth.getAppBaseUrl() });
+      if (subs.created.length > 0 || subs.failed.length > 0) {
+        console.log("[background] Shopify webhook subscriptions", subs);
+      }
+    } catch (err) {
+      console.error("[background] couldn't check Shopify webhook subscriptions", err.message);
+    }
+    try {
+      const sweep = await storeCredit.sweepRecentOrders();
+      if (sweep.changed > 0 || sweep.failed > 0) console.log("[background] deposit sweep", sweep);
+    } catch (err) {
+      console.error("[background] deposit sweep failed", err.message);
+    } finally {
+      running = false;
+    }
+  }
+  // unref: this timer alone should never keep the process alive.
+  setInterval(run, BACKGROUND_INTERVAL_MS).unref();
+  return run();
+}
+
+async function start() {
+  assertRequiredEnv();
+  warnAboutConfig();
+  // Sessions and login tokens live in the database, so the schema has to be
+  // in place before the first request.
+  await db.initSchema();
+  const services = createServices();
+  const app = buildApp(services);
   app.listen(PORT, () => {
-          console.log(`Smith Creek Texts listening on port ${PORT}`);
+    console.log(`Smith Creek Texts listening on port ${PORT}`);
+  });
+  // Not awaited: the app is up and serving while this runs. Exposed so a
+  // test can wait for the first pass.
+  app.backgroundTasks = startBackgroundTasks(services);
+  return app;
+}
+
+if (require.main === module) {
+  // Render restarts the process after a crash, so exiting on an uncaught
+  // exception trades a few seconds of downtime for not running on
+  // possibly-corrupted state. A rejected promise nobody caught is logged
+  // without exiting, whatever Node version this runs on.
+  process.on("uncaughtException", (err) => {
+    console.error("Uncaught exception - exiting so Render can restart cleanly", err);
+    process.exit(1);
+  });
+  process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled promise rejection", reason);
+  });
+
+  start().catch(function (err) {
+    console.error("Fatal startup error", err);
+    process.exit(1);
   });
 }
-// Called from the Stripe webhook once a text-a-payment-link checkout completes.
-// Records the payment as paid, then creates a real Shopify order for it (matched
-// to an existing customer by phone when possible) so it shows up as a deposit.
-async function handleCheckoutCompleted(session) {
-      const phone = (session.metadata && session.metadata.phone) || null;
-      const note = (session.metadata && session.metadata.note) || "";
-      const amountCents = session.amount_total;
-      const currency = (session.currency || "cad").toUpperCase();
-  // Stripe documents that a webhook event can be delivered more than once
-  // for the same event. markDepositPaid only flips status on the first
-  // call, so a redelivery here is a deliberate no-op rather than a second
-  // Shopify order for the same payment.
-  const wasNewlyPaid = await db.markDepositPaid(session.id, { amountCents, currency });
-  if (!wasNewlyPaid) {
-      console.log("Deposit already marked paid; skipping duplicate order creation", { sessionId: session.id });
-      return;
-  }
-  try {
-          const customer = phone ? await shopifyOrders.findCustomerByPhone(phone) : null;
-          const order = await shopifyOrders.createDepositOrder({
-                    customerId: customer ? customer.id : null,
-                    amountCents,
-                    note,
-                    stripeSessionId: session.id,
-          });
-          await db.recordDepositOrder(session.id, {
-                    shopifyOrderId: order.id,
-                    shopifyOrderName: order.name,
-          });
-  } catch (err) {
-          console.error("Failed to create Shopify deposit order", err.message);
-          await db.recordDepositOrderError(session.id, err.message);
-  }
-}
-// Called from the Helcim webhook once a text-a-payment-link invoice is paid.
-// The webhook payload itself is thin (Helcim's own docs call it out as such),
-// so this re-fetches the invoice from the API to confirm the amount and that
-// it's actually marked paid before trusting it - a webhook merely firing for
-// a given invoiceNumber isn't proof the card was approved.
-async function handleHelcimInvoicePaid(invoiceNumber) {
-  const deposit = await db.getDepositByInvoiceNumber(invoiceNumber);
-  if (!deposit) {
-    console.error("Helcim webhook for unknown invoice number", { invoiceNumber });
-    return;
-  }
 
-  let invoice;
-  try {
-    invoice = await helcimPayments.getInvoiceByNumber(invoiceNumber);
-  } catch (err) {
-    console.error("Failed to fetch Helcim invoice for confirmation", err.message);
-    return;
-  }
-  if (!invoice) {
-    console.error("Helcim invoice not found when confirming payment", { invoiceNumber });
-    return;
-  }
-
-  // Helcim's invoice object field names for status/total are inferred from
-  // its docs and haven't been exercised live yet - check Render logs
-  // ("[helcim] get invoice response") against this if payments don't flip to
-  // "paid" as expected.
-  const status = String(invoice.status || invoice.invoiceStatus || "").toUpperCase();
-  const isPaid = status === "PAID" || status === "COMPLETED";
-  if (!isPaid) {
-    console.log("Helcim webhook fired but invoice is not yet marked paid", { invoiceNumber, status });
-    return;
-  }
-
-  const amountCents = deposit.amount_cents;
-  const currency = deposit.currency || "CAD";
-
-  // markDepositPaidByInvoiceNumber only flips status on the first call, so a
-  // redelivered webhook here is a deliberate no-op rather than a second
-  // Shopify order for the same payment.
-  const wasNewlyPaid = await db.markDepositPaidByInvoiceNumber(invoiceNumber, { amountCents, currency });
-  if (!wasNewlyPaid) {
-    console.log("Deposit already marked paid; skipping duplicate order creation", { invoiceNumber });
-    return;
-  }
-
-  try {
-    const phone = deposit.phone;
-    const note = deposit.note || "";
-    const customer = phone ? await shopifyOrders.findCustomerByPhone(phone) : null;
-    const order = await shopifyOrders.createDepositOrder({
-      customerId: customer ? customer.id : null,
-      amountCents,
-      note,
-      provider: "Helcim",
-      providerReference: invoiceNumber,
-    });
-    await db.recordHelcimDepositOrder(invoiceNumber, {
-      shopifyOrderId: order.id,
-      shopifyOrderName: order.name,
-    });
-  } catch (err) {
-    console.error("Failed to create Shopify deposit order", err.message);
-    await db.recordHelcimDepositOrderError(invoiceNumber, err.message);
-  }
-}
-start().catch(function (err) {
-      console.error("Fatal startup error", err);
-      process.exit(1);
-});
+module.exports = { buildApp, createServices, startBackgroundTasks, start };

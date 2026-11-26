@@ -116,6 +116,7 @@ module.exports = {
     ALLOWED_LOGIN_EMAIL,
     TOKEN_TTL_MINUTES,
     SESSION_MAX_AGE_MS,
+    getAppBaseUrl,
     getSessionSecret,
     requestLoginLink,
     verifyToken,
