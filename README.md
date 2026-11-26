@@ -1,52 +1,125 @@
 # Smith Creek Texts
 
-Smith Creek Cycle's own customer texting app - a standalone inbox tied into
-Shopify (customers, orders, pay links) and Hubtiger (workshop job status).
+Smith Creek Cycle's own customer texting app: a staff-only tool tied into
+Twilio (texts and voicemail), Shopify (customers and orders), Hubtiger
+(workshop job cards) and Helcim (card payments).
 
-## Status
+## What it does today
 
-- Shopify side is done: a Dev Dashboard app ("Smith Creek Texts") is created
--   and installed on the store, with SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET
--     ready to use. src/shopify.js handles the token exchange (24h tokens via
--   client-credentials grant - there's no permanent Admin API token for this
--     app type).
-- - This repo is a minimal running skeleton: health check, Twilio webhook
-  -   routes, and the Shopify-relay-to-Hubtiger logic for incoming texts. It is
-  -     NOT yet the real inbox UI - that's the next build phase once hosting +
-  -   Twilio are live.
- 
-  -   ## Still needed before this is fully "live"
- 
-  -   1. A Twilio account and a Canadian SMS-capable number. Nothing here works
-      2.    without TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_PHONE_NUMBER.
-      3.2. Point the Twilio number's incoming-SMS webhook at
-           https://<this-app's-render-url>/webhooks/twilio-sms once deployed.
-        3. Give Hubtiger the same Twilio credentials in their "Connect Text
-        4.    Message Platform" form, so their own outbound status texts still send
-        5.   (this app's job is just owning the incoming webhook and relaying to
-        6.      Hubtiger's job-card endpoint - see HUBTIGER_INCOMING_SMS_WEBHOOK_URL,
-        7.     set as a secret env var on Render, never committed here).
-        8. 4. A database for the real inbox (message history, staff notes,
-           5.    automation rules) - not added yet; Postgres on Render is the natural
-           6.   choice when this grows past the skeleton stage.
-          
-           7.   ## Local dev
-          
-           8.   ```
-                npm install
-                cp .env.example .env
-                npm start
-                ```
+- **Needs reply** - who has texted or left a voicemail and hasn't been
+  answered yet.
+- **Text a payment link** - staff enter a phone number and an amount; the
+  customer gets a text with a link to a hosted invoice page.
+- **Deposits on the customer's account** - a deposit is held as Shopify
+  store credit, which staff see on the customer's profile in Shopify admin
+  and POS and the customer spends at pickup. It gets there two ways:
+  - a text payment link is paid in full (recorded as a Shopify order for
+    the Customer Deposit item, then credited), or
+  - staff ring up the **Customer Deposit** item (SKU `DEPOSIT`) in Shopify
+    POS with the customer attached.
 
-                ## Deploying on Render
+  Refunding the deposit order in Shopify takes the credit back off. The
+  payments page lists every deposit and anything that needs a person.
+- **Relay to Hubtiger** - every incoming text is forwarded so job cards stay
+  in sync.
 
-                This repo includes a render.yaml Blueprint.
+## How the code is laid out
 
-                1. New -> Blueprint, point it at this repo.
-                2. 2. Render reads render.yaml and creates the smith-creek-texts web
-                   3.    service automatically.
-                   4.3. Fill in the secret env vars it leaves blank (SHOPIFY_CLIENT_ID,
-                        SHOPIFY_CLIENT_SECRET, HUBTIGER_INCOMING_SMS_WEBHOOK_URL, TWILIO_*) in
-                        the Render dashboard - they're marked sync: false on purpose so they're
-                        never committed to this public repo.
-                     
+| File | What it's for |
+| --- | --- |
+| `src/server.js` | Entry point: config checks, wiring, middleware order |
+| `src/deposits.js` | The payment-link workflow and the "is it really paid?" rules |
+| `src/storeCredit.js` | Deposits held as store credit: the one rule, and the function that applies it |
+| `src/shopifyStoreCredit.js` | The two Shopify calls that move store credit |
+| `src/shopifyWebhooks.js`, `src/routes/shopifyWebhooks.js` | Shopify webhook verification, subscriptions and `/webhooks/shopify` |
+| `src/money.js` | Exact cents <-> decimal strings |
+| `src/helcimPayments.js` | Payment processor API client and webhook verification |
+| `src/routes/paymentWebhooks.js` | `/webhooks/payments` (and the dormant Stripe webhook) |
+| `src/routes/twilioWebhooks.js` | Incoming texts, status callbacks, voicemail |
+| `src/routes/login.js` | Passwordless staff login |
+| `src/routes/staff.js` | Staff pages |
+| `src/views.js` | All HTML |
+| `src/db.js` | Schema and every SQL query |
+| `src/security.js`, `src/auth.js` | Headers, rate limits, signatures, CSRF, sessions, geo check |
+| `src/validation.js`, `src/phone.js` | Form validation, phone number normalization |
+| `src/shopify.js`, `src/shopifyOrders.js`, `src/sms.js`, `src/needsReply.js` | Shopify and Twilio clients |
+| `src/stripePayments.js` | Dormant: the previous payment processor, kept as a fallback |
+
+`SECURITY.md` explains what protects the app and what is still open.
+
+## Configuration
+
+Set in the Render dashboard, never committed. Required to start:
+`DATABASE_URL`. Everything else is needed only by the feature that uses it.
+
+| Variable | Used for |
+| --- | --- |
+| `APP_SECRET` | Signing session cookies (generated by Render) |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` | Emailing login links |
+| `ALLOWED_LOGIN_EMAIL` | The one address allowed to log in (default `info@smithcreekcycle.ca`) |
+| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` | Texting, and verifying Twilio's webhooks |
+| `HELCIM_API_TOKEN` | Creating invoices and confirming payments |
+| `HELCIM_SUBDOMAIN` | The part before `.myhelcim.com` in the account's invoice links |
+| `HELCIM_WEBHOOK_VERIFIER_TOKEN` | Verifying payment webhooks |
+| `SHOPIFY_STORE_DOMAIN`, `SHOPIFY_CLIENT_ID`, `SHOPIFY_CLIENT_SECRET` | Shopify Admin API, and verifying Shopify's webhooks |
+| `APP_BASE_URL` | This app's public address (default `https://smith-creek-texts.onrender.com`); login links and Shopify webhooks point here |
+| `DEPOSIT_SKU` | SKU of the Customer Deposit item (default `DEPOSIT`) |
+| `DEPOSITS_LIVE_FROM` | Sales before this date are never treated as deposits (default 26 Nov 2026). Set it to a future date to switch store credit off |
+| `HUBTIGER_INCOMING_SMS_WEBHOOK_URL` | Where incoming texts are relayed |
+| `PHONE_MODULE_ENABLED` | `true` turns on the voicemail greeting |
+| `GEO_RESTRICT_ENABLED` | `false` turns off the country check |
+
+### Payment webhook setup
+
+In the Helcim dashboard: All Tools > Integrations > Webhooks. Turn webhooks
+on, turn on the card transaction event, and set the Deliver URL to
+
+    https://smith-creek-texts.onrender.com/webhooks/payments
+
+Copy the Verifier Token shown there into `HELCIM_WEBHOOK_VERIFIER_TOKEN`.
+The API token needs access to invoices and card transactions.
+
+### Deposits and store credit setup
+
+1. **App permissions** (Shopify Dev Dashboard > Smith Creek Texts >
+   Versions): the app needs `read_orders`, `write_orders`, `read_all_orders`,
+   `read_customers`, `write_customers` and
+   `write_store_credit_account_transactions`. Release the version and
+   approve the new permissions on the store.
+2. **The deposit item** (Shopify admin > Products): a product called
+   "Customer Deposit" whose variants all have SKU `DEPOSIT`, are not
+   taxable, don't track inventory and aren't physical products. A $1.00
+   variant lets staff enter any amount as a quantity (300 = $300); add
+   fixed variants ($50, $100, $250, $500) for one-tap amounts. Publish it
+   to Point of Sale only - not the Online Store.
+3. **Store credit at the till** (Shopify admin > Point of Sale > Settings):
+   turn on store credit as a payment method, and give the right staff the
+   "Redeem store credit" permission.
+4. Nothing to set up for webhooks: the app subscribes itself at boot
+   (`orders/paid`, `orders/updated`, `orders/cancelled`, `refunds/create`
+   to `/webhooks/shopify`) and re-checks every 30 minutes.
+
+Day to day:
+
+- **Take a deposit in store**: add the customer to the cart, add Customer
+  Deposit for the amount, take payment. The store credit appears on their
+  profile within a few seconds.
+- **Take a deposit by text**: Send a payment link. When it's paid, the
+  order and the store credit are created automatically.
+- **At pickup**: ring up the bike at full price and choose Store credit as
+  a payment method. Tax is charged on the full price, as it should be.
+- **Cancel a deposit**: refund the deposit order in Shopify (and, for a
+  text-link deposit, refund the card in Helcim - Shopify only records it).
+  The store credit comes off by itself.
+- **Something looks wrong**: the payments page shows every deposit, flags
+  anything waiting on a person, and has a box to re-check any order number.
+
+## Development
+
+    npm install
+    npm test
+
+Tests use Node's built-in runner. `test/deposits.test.js`,
+`test/storeCredit.test.js`, `test/shopify.test.js` and
+`test/helcimPayments.test.js` cover the money path with no network or
+database.
