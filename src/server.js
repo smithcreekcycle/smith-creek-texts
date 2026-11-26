@@ -1,4 +1,5 @@
 require("dotenv").config();
+const crypto = require("crypto");
 const express = require("express");
 const session = require("express-session");
 const PgSession = require("connect-pg-simple")(session);
@@ -6,7 +7,11 @@ const { getAccessToken } = require("./shopify");
 const twilio = require("twilio");
 const db = require("./db");
 const needsReply = require("./needsReply");
+// Stripe is no longer used to send payment links (see helcimPayments below),
+// but the module and its webhook route are kept in place, dormant, as a
+// backup in case Helcim needs to be rolled back.
 const stripePayments = require("./stripePayments");
+const helcimPayments = require("./helcimPayments");
 const shopifyOrders = require("./shopifyOrders");
 const sms = require("./sms");
 const auth = require("./auth");
@@ -88,6 +93,85 @@ app.post(
         res.sendStatus(200);
       }
     );
+// Helcim's webhooks follow the Standard Webhooks spec: HMAC-SHA256 over
+// `${webhook-id}.${webhook-timestamp}.${rawBody}`, keyed by the base64-decoded
+// verifierToken from the Helcim dashboard (All Tools > Integrations >
+// Webhooks). Like the Stripe route above, this needs the raw body, so it's
+// registered before the body parsers.
+app.post(
+  "/webhooks/helcim",
+  express.raw({ type: "application/json", limit: "1mb" }),
+  async (req, res) => {
+    const verifierToken = process.env.HELCIM_WEBHOOK_VERIFIER_TOKEN;
+    if (!verifierToken) {
+      console.error("Helcim webhook received but HELCIM_WEBHOOK_VERIFIER_TOKEN is not configured");
+      return res.sendStatus(500);
+    }
+
+    const webhookId = req.headers["webhook-id"];
+    const webhookTimestamp = req.headers["webhook-timestamp"];
+    const webhookSignature = req.headers["webhook-signature"];
+    if (!webhookId || !webhookTimestamp || !webhookSignature) {
+      console.error("Helcim webhook missing required headers");
+      return res.sendStatus(400);
+    }
+
+    try {
+      const signedContent = `${webhookId}.${webhookTimestamp}.${req.body.toString("utf8")}`;
+      const verifierTokenBytes = Buffer.from(verifierToken, "base64");
+      const expectedSignature = crypto
+        .createHmac("sha256", verifierTokenBytes)
+        .update(signedContent)
+        .digest("base64");
+
+      // webhook-signature can carry multiple space-separated "v1,<sig>"
+      // values; check ours against all of them rather than assuming the
+      // first is the right scheme/version.
+      const providedSignatures = String(webhookSignature)
+        .split(" ")
+        .map((part) => part.split(",")[1])
+        .filter(Boolean);
+      const isValid = providedSignatures.some((sig) => {
+        try {
+          return crypto.timingSafeEqual(Buffer.from(sig, "base64"), Buffer.from(expectedSignature, "base64"));
+        } catch (e) {
+          return false;
+        }
+      });
+      if (!isValid) {
+        console.error("Helcim webhook signature verification failed");
+        return res.sendStatus(400);
+      }
+    } catch (err) {
+      console.error("Helcim webhook signature verification error", err.message);
+      return res.sendStatus(400);
+    }
+
+    let event;
+    try {
+      event = JSON.parse(req.body.toString("utf8"));
+    } catch (err) {
+      console.error("Helcim webhook body was not valid JSON", err.message);
+      return res.sendStatus(400);
+    }
+
+    // Helcim's only documented event type today is "cardTransaction" - fired
+    // for both approved and declined attempts. The body is thin (mostly
+    // IDs), so handleHelcimInvoicePaid re-fetches the invoice from the API
+    // rather than trusting amount/status fields that may or may not be on
+    // the webhook payload itself.
+    console.log("[helcim] webhook received", JSON.stringify(event));
+    const invoiceNumber = event && event.data && (event.data.invoiceNumber || event.data.invoice_number);
+    if (event && event.type === "cardTransaction" && invoiceNumber) {
+      try {
+        await handleHelcimInvoicePaid(String(invoiceNumber));
+      } catch (err) {
+        console.error("Failed to handle Helcim invoice payment", err.message);
+      }
+    }
+    res.sendStatus(200);
+  }
+);
 // Twilio posts form-encoded; everything else that takes a body is JSON or a
 // browser form post. A 100kb cap is generous for anything this app actually
 // receives and rejects an oversized body before it's fully buffered.
@@ -293,7 +377,7 @@ async function start() {
           }
           res.redirect("/inbox/needs-reply");
   });
-  // Staff-facing form to text a Stripe payment link to a customer.
+  // Staff-facing form to text a payment link to a customer.
   app.get("/payments/send", auth.requireCanada, auth.requireAuth, (req, res) => {
           const phone = req.query.phone || "";
           res.type("html").send(`<!doctype html>
@@ -331,9 +415,10 @@ async function start() {
           const { phone, note } = data;
           try {
                     const amountCents = Math.round(data.amount * 100);
-                    const session = await stripePayments.createDepositCheckout({ phone, amountCents, note });
-                    await db.recordDepositCreated({
-                                stripeSessionId: session.id,
+                    const invoice = await helcimPayments.createDepositInvoice({ phone, amountCents, note });
+                    await db.recordHelcimDepositCreated({
+                                helcimInvoiceNumber: invoice.invoiceNumber,
+                                helcimToken: invoice.token,
                                 phone,
                                 amountCents,
                                 currency: "CAD",
@@ -341,7 +426,7 @@ async function start() {
                     });
                     await sms.sendSms(
                                 phone,
-                                `Smith Creek Cycle: here's your secure payment link${note ? ` for ${note}` : ""}: ${session.url}`
+                                `Smith Creek Cycle: here's your secure payment link${note ? ` for ${note}` : ""}: ${invoice.url}`
                               );
                     res.type("html").send(`<!doctype html>
                     <html><body style="font-family: sans-serif; max-width: 480px; margin: 60px auto;">
@@ -392,9 +477,13 @@ async function start() {
                     res.status(500).send(`Failed to load payments: ${escapeHtml(err.message)}`);
           }
   });
-  // ---- Customer-facing pages: no login, no geo-restriction. A customer who
-  // just paid via a Stripe-hosted checkout lands here; they shouldn't be
-  // blocked just because they're travelling outside Canada. ----
+  // ---- Customer-facing pages: no login, no geo-restriction. These were the
+  // redirect targets for Stripe Checkout; Helcim's hosted invoice page shows
+  // its own confirmation instead of redirecting back here, so these two
+  // routes are currently unused in the live flow but kept in case that's
+  // ever wired up (or Stripe is reactivated). They stay public so a customer
+  // landing here isn't blocked just because they're travelling outside
+  // Canada. ----
   app.get("/payments/success", (_req, res) => {
           res.type("html").send(`<!doctype html>
           <html><body style="font-family: sans-serif; max-width: 480px; margin: 60px auto; text-align:center;">
@@ -528,6 +617,73 @@ async function handleCheckoutCompleted(session) {
   } catch (err) {
           console.error("Failed to create Shopify deposit order", err.message);
           await db.recordDepositOrderError(session.id, err.message);
+  }
+}
+// Called from the Helcim webhook once a text-a-payment-link invoice is paid.
+// The webhook payload itself is thin (Helcim's own docs call it out as such),
+// so this re-fetches the invoice from the API to confirm the amount and that
+// it's actually marked paid before trusting it - a webhook merely firing for
+// a given invoiceNumber isn't proof the card was approved.
+async function handleHelcimInvoicePaid(invoiceNumber) {
+  const deposit = await db.getDepositByInvoiceNumber(invoiceNumber);
+  if (!deposit) {
+    console.error("Helcim webhook for unknown invoice number", { invoiceNumber });
+    return;
+  }
+
+  let invoice;
+  try {
+    invoice = await helcimPayments.getInvoiceByNumber(invoiceNumber);
+  } catch (err) {
+    console.error("Failed to fetch Helcim invoice for confirmation", err.message);
+    return;
+  }
+  if (!invoice) {
+    console.error("Helcim invoice not found when confirming payment", { invoiceNumber });
+    return;
+  }
+
+  // Helcim's invoice object field names for status/total are inferred from
+  // its docs and haven't been exercised live yet - check Render logs
+  // ("[helcim] get invoice response") against this if payments don't flip to
+  // "paid" as expected.
+  const status = String(invoice.status || invoice.invoiceStatus || "").toUpperCase();
+  const isPaid = status === "PAID" || status === "COMPLETED";
+  if (!isPaid) {
+    console.log("Helcim webhook fired but invoice is not yet marked paid", { invoiceNumber, status });
+    return;
+  }
+
+  const amountCents = deposit.amount_cents;
+  const currency = deposit.currency || "CAD";
+
+  // markDepositPaidByInvoiceNumber only flips status on the first call, so a
+  // redelivered webhook here is a deliberate no-op rather than a second
+  // Shopify order for the same payment.
+  const wasNewlyPaid = await db.markDepositPaidByInvoiceNumber(invoiceNumber, { amountCents, currency });
+  if (!wasNewlyPaid) {
+    console.log("Deposit already marked paid; skipping duplicate order creation", { invoiceNumber });
+    return;
+  }
+
+  try {
+    const phone = deposit.phone;
+    const note = deposit.note || "";
+    const customer = phone ? await shopifyOrders.findCustomerByPhone(phone) : null;
+    const order = await shopifyOrders.createDepositOrder({
+      customerId: customer ? customer.id : null,
+      amountCents,
+      note,
+      provider: "Helcim",
+      providerReference: invoiceNumber,
+    });
+    await db.recordHelcimDepositOrder(invoiceNumber, {
+      shopifyOrderId: order.id,
+      shopifyOrderName: order.name,
+    });
+  } catch (err) {
+    console.error("Failed to create Shopify deposit order", err.message);
+    await db.recordHelcimDepositOrderError(invoiceNumber, err.message);
   }
 }
 start().catch(function (err) {
