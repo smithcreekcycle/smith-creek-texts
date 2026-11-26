@@ -37,12 +37,24 @@ const json = await adminGraphQL(query, { q: `phone:${e164}` });
 }
 
     // Creates a real Shopify order for a deposit that was already collected via
-// Stripe, so it shows up in the customer's order history. The order is
-// recorded as paid using a SALE transaction referencing the gateway "Stripe".
-async function createDepositOrder({ customerId, amountCents, note, stripeSessionId }) {
+// a text payment link, so it shows up in the customer's order history. The
+// order is recorded as paid using a SALE transaction referencing the
+// payment gateway it actually went through.
+//
+// provider/providerReference default to the original Stripe shape so the
+// dormant Stripe code path (still kept as a backup) keeps working unchanged
+// if it's ever called again; the Helcim call site passes provider: "Helcim".
+async function createDepositOrder({
+  customerId,
+  amountCents,
+  note,
+  stripeSessionId,
+  provider = "Stripe",
+  providerReference = stripeSessionId,
+}) {
   const amount = (amountCents / 100).toFixed(2);
   const title = note ? `Deposit - ${note}` : "Deposit";
-  const orderNote = `Deposit collected via text payment link (Stripe checkout session ${stripeSessionId})${note ? ` - ${note}` : ""}`;
+  const orderNote = `Deposit collected via text payment link (${provider} reference ${providerReference})${note ? ` - ${note}` : ""}`;
 
 const mutation = `
 mutation CreateDepositOrder($order: OrderCreateOrderInput!, $options: OrderCreateOptionsInput) {
@@ -75,7 +87,7 @@ const order = {
     {
       kind: "SALE",
       status: "SUCCESS",
-      gateway: "Stripe",
+      gateway: provider,
       amountSet: { shopMoney: { amount, currencyCode: CURRENCY } },
     },
     ],
