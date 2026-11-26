@@ -50,6 +50,21 @@ async function initSchema() {
                                                                                 paid_at TIMESTAMPTZ
                                                                                     );
                                                                                       `);
+    // Deposits moved from Stripe to Helcim. Old Stripe rows are left exactly
+    // as they are (the user asked us not to touch that history); these
+    // columns just let new, Helcim-created rows live in the same table.
+    // stripe_session_id was NOT NULL when this table was Stripe-only - a
+    // Helcim deposit has no Stripe session, so that constraint has to go.
+    // All of these are safe to run every time the app starts.
+    await pool.query(`ALTER TABLE deposits ALTER COLUMN stripe_session_id DROP NOT NULL`);
+    await pool.query(`ALTER TABLE deposits ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'stripe'`);
+    await pool.query(`ALTER TABLE deposits ADD COLUMN IF NOT EXISTS helcim_invoice_number TEXT`);
+    await pool.query(`ALTER TABLE deposits ADD COLUMN IF NOT EXISTS helcim_token TEXT`);
+    await pool.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS deposits_helcim_invoice_number_idx
+            ON deposits (helcim_invoice_number)
+            WHERE helcim_invoice_number IS NOT NULL
+    `);
     // Single-use magic-link login tokens. Rows are cheap to accumulate; we
   // don't bother pruning old ones since the table will stay tiny.
   await pool.query(`
@@ -147,6 +162,58 @@ async function recordDepositOrderError(stripeSessionId, message) {
         );
 }
 
+// --- Helcim equivalents of the deposit functions above. Kept as separate
+// functions rather than generalizing the Stripe ones in place, so the
+// dormant Stripe code path above is untouched and still works if it's ever
+// needed again.
+
+async function recordHelcimDepositCreated({ helcimInvoiceNumber, helcimToken, phone, amountCents, currency, note }) {
+    if (!pool) return;
+    await pool.query(
+          `INSERT INTO deposits (provider, helcim_invoice_number, helcim_token, phone, amount_cents, currency, note)
+               VALUES ('helcim', $1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (helcim_invoice_number) DO NOTHING`,
+          [helcimInvoiceNumber, helcimToken, phone, amountCents, currency, note || null]
+        );
+}
+
+// Same idempotency guard as markDepositPaid: Helcim redelivers webhooks too,
+// so this must be safe to call more than once for the same invoice.
+async function markDepositPaidByInvoiceNumber(helcimInvoiceNumber, { amountCents, currency }) {
+    if (!pool) return false;
+    const { rowCount } = await pool.query(
+          `UPDATE deposits SET status = 'paid', paid_at = now(), amount_cents = $2, currency = $3
+               WHERE helcim_invoice_number = $1 AND status <> 'paid'`,
+          [helcimInvoiceNumber, amountCents, currency]
+        );
+    return rowCount > 0;
+}
+
+async function recordHelcimDepositOrder(helcimInvoiceNumber, { shopifyOrderId, shopifyOrderName }) {
+    if (!pool) return;
+    await pool.query(
+          `UPDATE deposits SET shopify_order_id = $2, shopify_order_name = $3 WHERE helcim_invoice_number = $1`,
+          [helcimInvoiceNumber, shopifyOrderId, shopifyOrderName]
+        );
+}
+
+async function recordHelcimDepositOrderError(helcimInvoiceNumber, message) {
+    if (!pool) return;
+    await pool.query(
+          `UPDATE deposits SET status = 'order_failed', error_message = $2 WHERE helcim_invoice_number = $1`,
+          [helcimInvoiceNumber, message]
+        );
+}
+
+async function getDepositByInvoiceNumber(helcimInvoiceNumber) {
+    if (!pool) return null;
+    const { rows } = await pool.query(
+          `SELECT * FROM deposits WHERE helcim_invoice_number = $1`,
+          [helcimInvoiceNumber]
+        );
+    return rows[0] || null;
+}
+
 async function getRecentDeposits() {
     if (!pool) return [];
     const { rows } = await pool.query(
@@ -187,6 +254,11 @@ module.exports = {
     markDepositPaid,
     recordDepositOrder,
     recordDepositOrderError,
+    recordHelcimDepositCreated,
+    markDepositPaidByInvoiceNumber,
+    recordHelcimDepositOrder,
+    recordHelcimDepositOrderError,
+    getDepositByInvoiceNumber,
     getRecentDeposits,
     createLoginToken,
     consumeLoginToken,
